@@ -8,25 +8,32 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 )
 
-// Publisher wraps a Kafka producer config, and provides a method that
+// Writer is the interface which represents a writing io of Kafka.
+// github.com/segmentio/kafka-go Writer is recommended as the concrete
+// implementation.
+type Writer interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+
+// Publisher wraps a Kafka writer, and provides a method that
 // implements endpoint.Endpoint.
 type Publisher struct {
-	writer  *kafka.Writer
+	writer  Writer
 	enc     EncodeRequestFunc
-	dec     DecodeResponseFunc
 	before  []RequestFunc
-	after   []PublisherResponseFunc
 	timeout time.Duration
 }
 
 // NewPublisher constructs a Kafka Publisher
 // based on the given kafka.WriterConfig.
 func NewPublisher(
-	writer *kafka.Writer,
+	writer Writer,
+	enc EncodeRequestFunc,
 	options ...PublisherOption,
 ) *Publisher {
 	p := &Publisher{
 		writer: writer,
+		enc:    enc,
 	}
 	for _, option := range options {
 		option(p)
@@ -43,13 +50,6 @@ func PublisherBefore(before ...RequestFunc) PublisherOption {
 	return func(p *Publisher) { p.before = append(p.before, before...) }
 }
 
-// PublisherAfter sets the ClientResponseFuncs applied to the incoming Kafka
-// request prior to it being decoded. This is useful for obtaining anything off
-// of the response and adding onto the context prior to decoding.
-func PublisherAfter(after ...PublisherResponseFunc) PublisherOption {
-	return func(p *Publisher) { p.after = append(p.after, after...) }
-}
-
 // PublisherTimeout sets the available timeout for an Kafka request.
 func PublisherTimeout(timeout time.Duration) PublisherOption {
 	return func(p *Publisher) { p.timeout = timeout }
@@ -61,32 +61,21 @@ func (p Publisher) Endpoint() endpoint.Endpoint {
 		ctx, cancel := context.WithTimeout(ctx, p.timeout)
 		defer cancel()
 
-		msgs := []kafka.Message{
-			{Time: time.Now()},
-		}
+		msg := kafka.Message{}
 
-		if err := p.enc(ctx, msgs, request); err != nil {
+		if err := p.enc(ctx, &msg, request); err != nil {
 			return nil, err
 		}
 
 		for _, f := range p.before {
-			ctx = f(ctx, msgs)
+			ctx = f(ctx, &msg)
 		}
 
-		err := p.writer.WriteMessages(ctx, msgs...)
+		err := p.writer.WriteMessages(ctx, msg)
 		if err != nil {
 			return nil, err
 		}
 
-		stats := p.writer.Stats()
-		for _, f := range p.after {
-			ctx = f(ctx, &stats)
-		}
-		response, err := p.dec(ctx, &stats)
-		if err != nil {
-			return nil, err
-		}
-
-		return response, nil
+		return p.writer, nil
 	}
 }
