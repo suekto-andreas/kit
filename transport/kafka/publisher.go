@@ -32,8 +32,9 @@ func NewPublisher(
 	options ...PublisherOption,
 ) *Publisher {
 	p := &Publisher{
-		writer: writer,
-		enc:    enc,
+		writer:  writer,
+		enc:     enc,
+		timeout: 10 * time.Second,
 	}
 	for _, option := range options {
 		option(p)

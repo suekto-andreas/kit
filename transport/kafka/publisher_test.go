@@ -12,16 +12,27 @@ import (
 )
 
 type mockWriter struct {
-	writeError error
-	writeMsgs  []kafka.Message
+	writeError  error
+	writeMsgs   []kafka.Message
+	processTime time.Duration
 }
 
 func (mw *mockWriter) WriteMessages(ctx context.Context, msgs ...kafka.Message) error {
-	for _, msg := range msgs {
-		mw.writeMsgs = append(mw.writeMsgs, msg)
-	}
+	msgchan := make(chan string)
+	go func() {
+		for _, msg := range msgs {
+			mw.writeMsgs = append(mw.writeMsgs, msg)
+			time.Sleep(mw.processTime)
+		}
+		msgchan <- "done"
+	}()
 
-	return mw.writeError
+	select {
+	case <-msgchan:
+		return mw.writeError
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (mw *mockWriter) SetWriteError(err error) *mockWriter {
@@ -52,7 +63,7 @@ func testReqEncoder(ctx context.Context, msg *kafka.Message, request interface{}
 }
 
 func TestSuccessfulPublish(t *testing.T) {
-	mw := &mockWriter{}
+	mw := &mockWriter{processTime: 1 * time.Millisecond}
 	mw.SetWriteError(nil)
 
 	publisher := NewPublisher(
@@ -86,5 +97,86 @@ func TestSuccessfulPublish(t *testing.T) {
 	if writtenValue.Content != strings.ToUpper(req.Content) {
 		t.Fatalf("content is not as expected.\nExpect:%+v\nActual:%+v",
 			strings.ToUpper(req.Content), writtenValue.Content)
+	}
+}
+
+func TestErrorPublishEncoding(t *testing.T) {
+	mw := &mockWriter{processTime: 1 * time.Millisecond}
+	mw.SetWriteError(nil)
+
+	publisher := NewPublisher(
+		mw,
+		testReqEncoder,
+		PublisherBefore(
+			func(ctx context.Context, msg *kafka.Message) context.Context {
+				msg.Value = []byte(strings.ToUpper(string(msg.Value)))
+				return ctx
+			}),
+	)
+
+	// request is in bad structure causing error in encoding with testReqEncoder
+	req := struct {
+		ID   string `json:"id"`
+		Text string `json:"text"`
+	}{
+		ID:   "1",
+		Text: "okie-dokie",
+	}
+	_, err := publisher.Endpoint()(context.Background(), req)
+	if err == nil {
+		t.Fatalf("there should be an error.")
+	}
+}
+
+func TestErrorPublishWriting(t *testing.T) {
+	mw := &mockWriter{processTime: 1 * time.Millisecond}
+	mw.SetWriteError(fmt.Errorf("error in writing"))
+
+	publisher := NewPublisher(
+		mw,
+		testReqEncoder,
+	)
+
+	req := testReq{
+		ID:      "1",
+		Content: "okie-dokie",
+	}
+	_, err := publisher.Endpoint()(context.Background(), req)
+	if err == nil {
+		t.Fatalf("there should be an error")
+	}
+	if err.Error() != mw.writeError.Error() {
+		t.Fatalf("write error is not as expected.\nExpect: %s\nActual: %s\n",
+			mw.writeError.Error(), err.Error())
+	}
+}
+
+func TestPublisherTimeout(t *testing.T) {
+	mw := &mockWriter{}
+	mw.SetWriteError(nil)
+
+	ch := make(chan struct{})
+	defer close(ch)
+
+	publisher := NewPublisher(
+		mw,
+		testReqEncoder,
+		PublisherBefore(
+			func(ctx context.Context, msg *kafka.Message) context.Context {
+				msg.Value = []byte(strings.ToUpper(string(msg.Value)))
+				time.Sleep(20 * time.Millisecond)
+				return ctx
+			}),
+		PublisherTimeout(10*time.Millisecond),
+	)
+	fmt.Printf("%+v\n", publisher.timeout)
+
+	req := testReq{
+		ID:      "1",
+		Content: "okie-dokie",
+	}
+	_, err := publisher.Endpoint()(context.Background(), req)
+	if err != context.DeadlineExceeded {
+		t.Errorf("want %s, have %+v", context.DeadlineExceeded, err)
 	}
 }
